@@ -65,4 +65,14 @@ class PoolRequest(BaseModel):
             raise ValueError("source tube ids must be distinct")
         if self.new_id in ids:
             raise ValueError("new tube id must differ from every source id")
+        # The new tube's volume is the sum of the contributions. Every volume
+        # column is a signed 64-bit INTEGER, so a sum past the ceiling must die
+        # here, as a stable 422 input error — before any balance is touched —
+        # rather than surfacing as a server error inside the transaction.
+        total = sum(source.amount_ul for source in self.sources)
+        if total > SQLITE_INT64_MAX:
+            raise ValueError(
+                f"sources total {total} uL exceeds the storable limit "
+                f"{SQLITE_INT64_MAX} uL"
+            )
         return self
