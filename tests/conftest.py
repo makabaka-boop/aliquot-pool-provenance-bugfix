@@ -21,6 +21,18 @@ def make_split(parent: str, revision: int, key: str, children: list[tuple[str, i
     }
 
 
+def make_pool(new_id: str, key: str, sources: list[tuple[str, int, int]]) -> dict:
+    """sources: [(id, expected_revision, amount_ul), ...]"""
+    return {
+        "new_id": new_id,
+        "request_key": key,
+        "sources": [
+            {"id": sid, "expected_revision": rev, "amount_ul": amt}
+            for sid, rev, amt in sources
+        ],
+    }
+
+
 def total_balance(client: TestClient) -> int:
     return sum(t["balance_ul"] for t in client.get("/tubes").json()["tubes"])
 

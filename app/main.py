@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from . import db as dbmod
 from .errors import ApiError
-from .schemas import PoolRequest, RegisterTubeRequest, SplitRequest
+from .schemas import SQLITE_INT64_MAX, PoolRequest, RegisterTubeRequest, SplitRequest
 
 
 def _utcnow() -> str:
@@ -47,6 +47,36 @@ def _split_record(conn: sqlite3.Connection, split_row: sqlite3.Row) -> dict:
         "total_amount_ul": split_row["total_amount_ul"],
         "created_at": split_row["created_at"],
         "children": [dict(c) for c in children],
+    }
+
+
+def _pool_record(conn: sqlite3.Connection, pool_id: int) -> dict:
+    pool_row = conn.execute("SELECT * FROM pools WHERE id = ?", (pool_id,)).fetchone()
+    sources = conn.execute(
+        "SELECT source_id AS id, amount_ul, expected_revision, position "
+        "FROM pool_sources WHERE pool_id = ? ORDER BY position",
+        (pool_id,),
+    ).fetchall()
+    return {
+        "pool_id": pool_row["id"],
+        "new_tube_id": pool_row["new_tube_id"],
+        "request_key": pool_row["request_key"],
+        "total_amount_ul": pool_row["total_amount_ul"],
+        "created_at": pool_row["created_at"],
+        "sources": [dict(s) for s in sources],
+    }
+
+
+def _edge_view(edge: sqlite3.Row) -> dict:
+    return {
+        "child_id": edge["child_id"],
+        "parent_id": edge["parent_id"],
+        "operation": edge["operation"],
+        "position": edge["position"],
+        "amount_ul": edge["amount_ul"],
+        "total_amount_ul": edge["total_amount_ul"],
+        "split_id": edge["split_id"],
+        "pool_id": edge["pool_id"],
     }
 
 
@@ -117,53 +147,111 @@ def create_app(db_path: str) -> FastAPI:
         if row is None:
             raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
         view = _tube_view(row)
-        edge = conn.execute(
-            "SELECT parent_id FROM lineage_edges WHERE child_id = ?", (tube_id,)
-        ).fetchone()
-        view["parent_id"] = edge["parent_id"] if edge else None
-        pool = conn.execute("SELECT primary_source_id FROM pool_records WHERE child_id = ?", (tube_id,)).fetchone()
-        if pool is not None:
-            view["parent_id"] = pool["primary_source_id"]
+        # A tube is created by exactly one operation: a split gives one
+        # parent, a pool gives one parent per contributing source.
+        parents = conn.execute(
+            "SELECT parent_id FROM lineage_edges WHERE child_id = ? "
+            "ORDER BY position, parent_id",
+            (tube_id,),
+        ).fetchall()
+        parent_ids = [e["parent_id"] for e in parents]
+        view["parent_id"] = parent_ids[0] if len(parent_ids) == 1 else None
+        view["parent_ids"] = parent_ids
         return view
+
+    def _load_ancestor_graph(conn: sqlite3.Connection, tube_id: str) -> tuple[dict, dict]:
+        """Read the full ancestor DAG of tube_id — tubes and contribution
+        edges — using only the caller's current snapshot."""
+        nodes: dict[str, sqlite3.Row] = {}
+        edges: dict[tuple[str, str], sqlite3.Row] = {}
+        frontier = [tube_id]
+        seen: set[str] = set()
+        while frontier:
+            current_id = frontier.pop()
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            row = conn.execute(
+                "SELECT * FROM tubes WHERE id = ?", (current_id,)
+            ).fetchone()
+            if row is None:
+                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {current_id!r} does not exist")
+            nodes[current_id] = row
+            for edge in conn.execute(
+                "SELECT * FROM lineage_edges WHERE child_id = ? ORDER BY position, parent_id",
+                (current_id,),
+            ).fetchall():
+                edges[(edge["child_id"], edge["parent_id"])] = edge
+                if edge["parent_id"] not in seen:
+                    frontier.append(edge["parent_id"])
+        return nodes, edges
+
+    def _via_for_edge(conn: sqlite3.Connection, edge: sqlite3.Row) -> dict:
+        via = {
+            "parent_id": edge["parent_id"],
+            "position": edge["position"],
+            "amount_ul": edge["amount_ul"],
+        }
+        if edge["operation"] == "split":
+            split_row = conn.execute(
+                "SELECT * FROM splits WHERE id = ?", (edge["split_id"],)
+            ).fetchone()
+            via["operation"] = "split"
+            via["split"] = _split_record(conn, split_row)
+        else:
+            via["operation"] = "pool"
+            via["pool"] = _pool_record(conn, edge["pool_id"])
+        return via
+
+    def _hop_for(conn: sqlite3.Connection, nodes: dict, edges: dict, child_id: str, parent_id: str) -> dict:
+        return {"tube": _tube_view(nodes[child_id]),
+                "via": _via_for_edge(conn, edges[(child_id, parent_id)])}
 
     @app.get("/tubes/{tube_id}/ancestry")
     def get_ancestry(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
         # The whole walk runs inside one explicit read transaction, so every
-        # level of the chain is read from the same snapshot. Without it each
-        # SELECT is its own snapshot (autocommit) and concurrent splits of
-        # the descendant and its ancestors could be stitched into a balance
-        # combination that never existed at any single moment. In WAL mode a
-        # read transaction does not block writers. Each hop's split record
-        # carries expected_revision, pinning the exact parent revision (and
-        # thus the parent balance version) the split consumed.
+        # node and edge of the graph is read from the same snapshot. Without
+        # it each SELECT is its own snapshot (autocommit) and concurrent
+        # splits/pools could be stitched into a combination that never existed
+        # at any single moment. In WAL mode a read transaction does not block
+        # writers. Each edge's evidence carries the expected revision the
+        # operation consumed, pinning the exact source-balance versions.
         conn.execute("BEGIN")
         try:
-            # Walk parent pointers up to the root, then reverse -> root-first chain.
-            chain = []
-            current_id = tube_id
-            while True:
-                row = conn.execute("SELECT * FROM tubes WHERE id = ?", (current_id,)).fetchone()
-                if row is None:
-                    raise ApiError(404, "TUBE_NOT_FOUND", f"tube {current_id!r} does not exist")
-                edge = conn.execute(
-                    "SELECT parent_id, split_id, amount_ul FROM lineage_edges WHERE child_id = ?",
-                    (current_id,),
-                ).fetchone()
-                via = None
-                if edge is not None:
-                    split_row = conn.execute(
-                        "SELECT * FROM splits WHERE id = ?", (edge["split_id"],)
-                    ).fetchone()
-                    via = {
-                        "parent_id": edge["parent_id"],
-                        "amount_ul": edge["amount_ul"],
-                        "split": _split_record(conn, split_row),
-                    }
-                chain.append({"tube": _tube_view(row), "via": via})
-                if edge is None:
-                    break
-                current_id = edge["parent_id"]
-            chain.reverse()
+            nodes, edges = _load_ancestor_graph(conn, tube_id)
+            parents: dict[str, list[str]] = {}
+            for (child_id, parent_id), edge in edges.items():
+                parents.setdefault(child_id, []).append(parent_id)
+
+            root_ids = sorted(node_id for node_id in nodes if node_id not in parents)
+
+            # Enumerate every root -> tube_id path. A non-merged tube has
+            # exactly one (the historical linear chain); pooling can open
+            # several, one per root that contributed.
+            def paths_up(child_id: str) -> list[list[str]]:
+                up = parents.get(child_id, [])
+                if not up:
+                    return [[child_id]]
+                result = []
+                for parent_id in up:
+                    for path in paths_up(parent_id):
+                        result.append(path + [child_id])
+                return result
+
+            path_ids = sorted(paths_up(tube_id), key=lambda p: p)
+            chains = []
+            for path in path_ids:
+                hops = [{"tube": _tube_view(nodes[path[0]]), "via": None}]
+                for child_id, parent_id in zip(path[1:], path[:-1]):
+                    hops.append(_hop_for(conn, nodes, edges, child_id, parent_id))
+                chains.append(hops)
+
+            graph = {
+                "nodes": [_tube_view(nodes[nid]) for nid in sorted(nodes)],
+                "edges": [_edge_view(edges[key]) for key in sorted(edges)],
+                "roots": root_ids,
+            }
+            merged = any(len(up) > 1 for up in parents.values())
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -171,7 +259,19 @@ def create_app(db_path: str) -> FastAPI:
                 pass
             raise
         conn.execute("COMMIT")
-        return {"tube_id": tube_id, "depth": len(chain) - 1, "chain": chain}
+
+        depth = max((len(path) - 1 for path in path_ids), default=0)
+        payload = {
+            "tube_id": tube_id,
+            "depth": depth,
+            "lineage": "merged" if merged else "single",
+            # Backwards-compatible linear chain; present only when the tube
+            # has exactly one root-to-tube path (every split-only database).
+            "chain": chains[0] if len(chains) == 1 else None,
+            "chains": chains,
+            "graph": graph,
+        }
+        return payload
 
     @app.get("/tubes/{tube_id}/splits")
     def get_tube_splits(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
@@ -183,29 +283,45 @@ def create_app(db_path: str) -> FastAPI:
         ).fetchall()
         return {"tube_id": tube_id, "splits": [_split_record(conn, s) for s in splits]}
 
+    @app.get("/tubes/{tube_id}/pools")
+    def get_tube_pools(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+        row = conn.execute("SELECT id FROM tubes WHERE id = ?", (tube_id,)).fetchone()
+        if row is None:
+            raise ApiError(404, "TUBE_NOT_FOUND", f"tube {tube_id!r} does not exist")
+        pool_ids = [
+            r["pool_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT pool_id FROM pool_sources WHERE source_id = ? ORDER BY pool_id",
+                (tube_id,),
+            ).fetchall()
+        ]
+        return {"tube_id": tube_id, "pools": [_pool_record(conn, pid) for pid in pool_ids]}
+
+    @app.get("/pools/{pool_id}")
+    def get_pool(pool_id: int, conn: sqlite3.Connection = Depends(get_db)) -> dict:
+        row = conn.execute("SELECT id FROM pools WHERE id = ?", (pool_id,)).fetchone()
+        if row is None:
+            raise ApiError(404, "POOL_NOT_FOUND", f"pool {pool_id} does not exist")
+        return _pool_record(conn, pool_id)
+
     @app.get("/tubes/{tube_id}/provenance")
     def get_provenance(tube_id: str, conn: sqlite3.Connection = Depends(get_db)) -> dict:
-        nodes = []
-        edges = []
-        current_id = tube_id
-        while current_id:
-            row = conn.execute("SELECT * FROM tubes WHERE id = ?", (current_id,)).fetchone()
-            if row is None:
-                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {current_id!r} does not exist")
-            nodes.append(_tube_view(row))
-            edge = conn.execute("SELECT parent_id, amount_ul FROM lineage_edges WHERE child_id = ?", (current_id,)).fetchone()
-            if edge is None:
-                edge = conn.execute(
-                    "SELECT primary_source_id AS parent_id, total_amount_ul AS amount_ul "
-                    "FROM pool_records WHERE child_id = ?", (current_id,)
-                ).fetchone()
-            if edge is None:
-                break
-            edges.append({"parent_id": edge["parent_id"], "child_id": current_id, "amount_ul": edge["amount_ul"]})
-            current_id = edge["parent_id"]
-        nodes.reverse()
-        edges.reverse()
-        return {"tube_id": tube_id, "nodes": nodes, "edges": edges}
+        conn.execute("BEGIN")
+        try:
+            nodes, edges = _load_ancestor_graph(conn, tube_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        conn.execute("COMMIT")
+        return {
+            "tube_id": tube_id,
+            "nodes": [_tube_view(nodes[nid]) for nid in sorted(nodes)],
+            "edges": [_edge_view(edges[key]) for key in sorted(edges)],
+            "roots": sorted(nid for nid in nodes if all(c != nid for (c, _p) in edges)),
+        }
 
     # ---------------------------------------------------------------- split
 
@@ -217,8 +333,8 @@ def create_app(db_path: str) -> FastAPI:
         try:
             # BEGIN IMMEDIATE takes the database write lock up front, so the
             # check-then-act sequence below is serialised against every other
-            # split: a concurrent request on the same parent either waits and
-            # then sees the bumped revision (412), or replays the stored
+            # mutation: a concurrent request on the same parent either waits
+            # and then sees the bumped revision (412), or replays the stored
             # idempotent response.
             conn.execute("BEGIN IMMEDIATE")
 
@@ -294,9 +410,10 @@ def create_app(db_path: str) -> FastAPI:
                     (split_id, child.id, child.amount_ul, position),
                 )
                 conn.execute(
-                    "INSERT INTO lineage_edges (child_id, parent_id, split_id, amount_ul) "
-                    "VALUES (?, ?, ?, ?)",
-                    (child.id, req.parent_id, split_id, child.amount_ul),
+                    "INSERT INTO lineage_edges (child_id, parent_id, position, operation, "
+                    "split_id, pool_id, amount_ul, total_amount_ul) "
+                    "VALUES (?, ?, 0, 'split', ?, NULL, ?, ?)",
+                    (child.id, req.parent_id, split_id, child.amount_ul, total),
                 )
 
             response = {
@@ -314,8 +431,9 @@ def create_app(db_path: str) -> FastAPI:
                 "created_at": now,
             }
             conn.execute(
-                "INSERT INTO idempotency_keys (request_key, request_hash, request_body, "
-                "response_body, split_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO idempotency_keys (request_key, operation, request_hash, request_body, "
+                "response_body, split_id, pool_id, created_at) "
+                "VALUES (?, 'split', ?, ?, ?, ?, NULL, ?)",
                 (req.request_key, digest, canonical, json.dumps(response, ensure_ascii=False),
                  split_id, now),
             )
@@ -328,39 +446,155 @@ def create_app(db_path: str) -> FastAPI:
                 pass
             raise
 
+    # ---------------------------------------------------------------- pool
+
     @app.post("/pools", status_code=201)
-    def pool_tubes(req: PoolRequest, conn: sqlite3.Connection = Depends(get_db)) -> dict:
-        total = 0
-        updated = []
-        for source in req.sources:
-            row = conn.execute("SELECT * FROM tubes WHERE id = ?", (source.id,)).fetchone()
-            if row is None:
-                raise ApiError(404, "TUBE_NOT_FOUND", f"tube {source.id!r} does not exist")
-            if row["revision"] != source.expected_revision:
-                raise ApiError(412, "REVISION_CONFLICT", f"source {source.id!r} has changed")
-            if row["balance_ul"] < source.amount_ul:
-                raise ApiError(422, "INSUFFICIENT_BALANCE", f"source {source.id!r} has insufficient balance")
-            remaining = row["balance_ul"] - source.amount_ul
-            conn.execute(
-                "UPDATE tubes SET balance_ul = ?, revision = revision + 1 WHERE id = ?",
-                (remaining, source.id),
-            )
-            total += source.amount_ul
-            updated.append({"id": source.id, "amount_ul": source.amount_ul,
-                            "balance_ul": remaining, "revision": source.expected_revision + 1})
-        now = _utcnow()
+    def pool_tubes(req: PoolRequest, conn: sqlite3.Connection = Depends(get_db)):
+        body = req.model_dump(mode="json")
+        canonical = _canonical(body)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         try:
-            conn.execute("INSERT INTO tubes (id, balance_ul, revision, created_at) VALUES (?, ?, 0, ?)",
-                         (req.new_id, total, now))
-        except sqlite3.IntegrityError:
-            raise ApiError(409, "CHILD_ID_EXISTS", f"tube {req.new_id!r} already exists")
-        conn.execute(
-            "INSERT INTO pool_records (child_id, request_key, primary_source_id, total_amount_ul, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (req.new_id, req.request_key, req.sources[0].id, total, now),
-        )
-        return {"request_key": req.request_key, "tube": {"id": req.new_id, "balance_ul": total, "revision": 0},
-                "sources": updated, "created_at": now}
+            # Everything this operation can observe or change happens in one
+            # serialised transaction. BEGIN IMMEDIATE takes the write lock
+            # before any check, so validation, deductions, revisions, the new
+            # tube, every contribution edge and the receipt either all commit
+            # together or are all rolled back — no early source can be left
+            # deducted when a later source fails.
+            conn.execute("BEGIN IMMEDIATE")
+
+            replay = conn.execute(
+                "SELECT request_hash, response_body FROM idempotency_keys WHERE request_key = ?",
+                (req.request_key,),
+            ).fetchone()
+            if replay is not None:
+                if replay["request_hash"] != digest:
+                    raise ApiError(
+                        409,
+                        "REQUEST_KEY_CONFLICT",
+                        f"request_key {req.request_key!r} was already used with a different body",
+                    )
+                conn.execute("COMMIT")
+                return JSONResponse(status_code=201, content=json.loads(replay["response_body"]))
+
+            # Validate every source before writing anything. Sources are
+            # checked in request order so the first problem is deterministic.
+            total = 0
+            source_views = []
+            source_rows = []
+            for source in req.sources:
+                total += source.amount_ul
+                row = conn.execute(
+                    "SELECT * FROM tubes WHERE id = ?", (source.id,)
+                ).fetchone()
+                if row is None:
+                    raise ApiError(
+                        404, "TUBE_NOT_FOUND", f"source tube {source.id!r} does not exist"
+                    )
+                if row["revision"] != source.expected_revision:
+                    raise ApiError(
+                        412,
+                        "REVISION_CONFLICT",
+                        f"source {source.id!r} is at revision {row['revision']}, "
+                        f"not {source.expected_revision}",
+                    )
+                if row["balance_ul"] < source.amount_ul:
+                    raise ApiError(
+                        422,
+                        "INSUFFICIENT_BALANCE",
+                        f"source {source.id!r} balance {row['balance_ul']} uL cannot provide "
+                        f"{source.amount_ul} uL",
+                    )
+                source_rows.append(row)
+
+            # The schema layer already rejects this; keep the guard next to
+            # the column that would overflow so a future caller can never
+            # surface a 500 from SQLite integer overflow.
+            if total > SQLITE_INT64_MAX:
+                raise ApiError(
+                    422,
+                    "POOL_TOTAL_EXCEEDS_LIMIT",
+                    f"sources total {total} uL exceeds the storable integer limit {SQLITE_INT64_MAX}",
+                )
+
+            if conn.execute(
+                "SELECT 1 FROM tubes WHERE id = ?", (req.new_id,)
+            ).fetchone() is not None:
+                raise ApiError(
+                    409, "CHILD_ID_EXISTS", f"tube {req.new_id!r} already exists"
+                )
+
+            now = _utcnow()
+
+            # Deduct every source with a conditional UPDATE on the revision
+            # observed above (defence in depth alongside the write lock).
+            for source, row in zip(req.sources, source_rows):
+                remaining = row["balance_ul"] - source.amount_ul
+                cur = conn.execute(
+                    "UPDATE tubes SET balance_ul = ?, revision = revision + 1 "
+                    "WHERE id = ? AND revision = ?",
+                    (remaining, source.id, source.expected_revision),
+                )
+                if cur.rowcount != 1:  # unreachable under the write lock
+                    raise ApiError(
+                        412,
+                        "REVISION_CONFLICT",
+                        f"source {source.id!r} changed concurrently",
+                    )
+                source_views.append(
+                    {
+                        "id": source.id,
+                        "amount_ul": source.amount_ul,
+                        "balance_ul": remaining,
+                        "revision": source.expected_revision + 1,
+                    }
+                )
+
+            conn.execute(
+                "INSERT INTO tubes (id, balance_ul, revision, created_at) VALUES (?, ?, 0, ?)",
+                (req.new_id, total, now),
+            )
+            cur = conn.execute(
+                "INSERT INTO pools (new_tube_id, request_key, total_amount_ul, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (req.new_id, req.request_key, total, now),
+            )
+            pool_id = cur.lastrowid
+            for position, source in enumerate(req.sources):
+                conn.execute(
+                    "INSERT INTO pool_sources (pool_id, source_id, position, expected_revision, "
+                    "amount_ul) VALUES (?, ?, ?, ?, ?)",
+                    (pool_id, source.id, position, source.expected_revision, source.amount_ul),
+                )
+                conn.execute(
+                    "INSERT INTO lineage_edges (child_id, parent_id, position, operation, "
+                    "split_id, pool_id, amount_ul, total_amount_ul) "
+                    "VALUES (?, ?, ?, 'pool', NULL, ?, ?, ?)",
+                    (req.new_id, source.id, position, pool_id, source.amount_ul, total),
+                )
+
+            response = {
+                "pool_id": pool_id,
+                "request_key": req.request_key,
+                "tube": {"id": req.new_id, "balance_ul": total, "revision": 0},
+                "sources": source_views,
+                "total_amount_ul": total,
+                "created_at": now,
+            }
+            conn.execute(
+                "INSERT INTO idempotency_keys (request_key, operation, request_hash, request_body, "
+                "response_body, split_id, pool_id, created_at) "
+                "VALUES (?, 'pool', ?, ?, ?, NULL, ?, ?)",
+                (req.request_key, digest, canonical, json.dumps(response, ensure_ascii=False),
+                 pool_id, now),
+            )
+            conn.execute("COMMIT")
+            return response
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     return app
 
